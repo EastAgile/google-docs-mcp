@@ -102,11 +102,11 @@ return drive;
  */
 function convertDocsJsonToMarkdown(docData: any): string {
     let markdown = '';
-    
+
     if (!docData.body?.content) {
         return 'Document appears to be empty.';
     }
-    
+
     docData.body.content.forEach((element: any) => {
         if (element.paragraph) {
             markdown += convertParagraphToMarkdown(element.paragraph);
@@ -116,7 +116,7 @@ function convertDocsJsonToMarkdown(docData: any): string {
             markdown += '\n---\n\n'; // Section break as horizontal rule
         }
     });
-    
+
     return markdown.trim();
 }
 
@@ -129,7 +129,7 @@ function convertParagraphToMarkdown(paragraph: any): string {
     let headingLevel = 0;
     let isList = false;
     let listType = '';
-    
+
     // Check paragraph style for headings and lists
     if (paragraph.paragraphStyle?.namedStyleType) {
         const styleType = paragraph.paragraphStyle.namedStyleType;
@@ -144,13 +144,13 @@ function convertParagraphToMarkdown(paragraph: any): string {
             headingLevel = 2;
         }
     }
-    
+
     // Check for bullet lists
     if (paragraph.bullet) {
         isList = true;
         listType = paragraph.bullet.listId ? 'bullet' : 'bullet';
     }
-    
+
     // Process text elements
     if (paragraph.elements) {
         paragraph.elements.forEach((element: any) => {
@@ -159,7 +159,7 @@ function convertParagraphToMarkdown(paragraph: any): string {
             }
         });
     }
-    
+
     // Format based on style
     if (isHeading && text.trim()) {
         const hashes = '#'.repeat(Math.min(headingLevel, 6));
@@ -169,7 +169,7 @@ function convertParagraphToMarkdown(paragraph: any): string {
     } else if (text.trim()) {
         return `${text.trim()}\n\n`;
     }
-    
+
     return '\n'; // Empty paragraph
 }
 
@@ -178,10 +178,10 @@ function convertParagraphToMarkdown(paragraph: any): string {
  */
 function convertTextRunToMarkdown(textRun: any): string {
     let text = textRun.content || '';
-    
+
     if (textRun.textStyle) {
         const style = textRun.textStyle;
-        
+
         // Apply formatting
         if (style.bold && style.italic) {
             text = `***${text}***`;
@@ -190,21 +190,21 @@ function convertTextRunToMarkdown(textRun: any): string {
         } else if (style.italic) {
             text = `*${text}*`;
         }
-        
+
         if (style.underline && !style.link) {
             // Markdown doesn't have native underline, use HTML
             text = `<u>${text}</u>`;
         }
-        
+
         if (style.strikethrough) {
             text = `~~${text}~~`;
         }
-        
+
         if (style.link?.url) {
             text = `[${text}](${style.link.url})`;
         }
     }
-    
+
     return text;
 }
 
@@ -215,13 +215,13 @@ function convertTableToMarkdown(table: any): string {
     if (!table.tableRows || table.tableRows.length === 0) {
         return '';
     }
-    
+
     let markdown = '\n';
     let isFirstRow = true;
-    
+
     table.tableRows.forEach((row: any) => {
         if (!row.tableCells) return;
-        
+
         let rowText = '|';
         row.tableCells.forEach((cell: any) => {
             let cellText = '';
@@ -238,9 +238,9 @@ function convertTableToMarkdown(table: any): string {
             }
             rowText += ` ${cellText} |`;
         });
-        
+
         markdown += rowText + '\n';
-        
+
         // Add header separator after first row
         if (isFirstRow) {
             let separator = '|';
@@ -251,7 +251,7 @@ function convertTableToMarkdown(table: any): string {
             isFirstRow = false;
         }
     });
-    
+
     return markdown + '\n';
 }
 
@@ -265,25 +265,47 @@ description: 'Reads the content of a specific Google Document, optionally return
 parameters: DocumentIdParameter.extend({
 format: z.enum(['text', 'json', 'markdown']).optional().default('text')
 .describe("Output format: 'text' (plain text), 'json' (raw API structure, complex), 'markdown' (experimental conversion)."),
-maxLength: z.number().optional().describe('Maximum character limit for text output. If not specified, returns full document content. Use this to limit very large documents.')
+maxLength: z.number().optional().describe('Maximum character limit for text output. If not specified, returns full document content. Use this to limit very large documents.'),
+tabId: z.string().optional().describe('The ID of the specific tab to read. If not specified, reads the first tab (or legacy document.body for documents without tabs).')
 }),
 execute: async (args, { log }) => {
 const docs = await getDocsClient();
-log.info(`Reading Google Doc: ${args.documentId}, Format: ${args.format}`);
+log.info(`Reading Google Doc: ${args.documentId}, Format: ${args.format}${args.tabId ? `, Tab: ${args.tabId}` : ''}`);
 
     try {
+        // Determine if we need tabs content
+        const needsTabsContent = !!args.tabId;
+
         const fields = args.format === 'json' || args.format === 'markdown'
             ? '*' // Get everything for structure analysis
             : 'body(content(paragraph(elements(textRun(content)))))'; // Just text content
 
         const res = await docs.documents.get({
             documentId: args.documentId,
-            fields: fields,
+            includeTabsContent: needsTabsContent,
+            fields: needsTabsContent ? '*' : fields, // Get full document if using tabs
         });
-        log.info(`Fetched doc: ${args.documentId}`);
+        log.info(`Fetched doc: ${args.documentId}${args.tabId ? ` (tab: ${args.tabId})` : ''}`);
+
+        // If tabId is specified, find the specific tab
+        let contentSource: any;
+        if (args.tabId) {
+            const targetTab = GDocsHelpers.findTabById(res.data, args.tabId);
+            if (!targetTab) {
+                throw new UserError(`Tab with ID "${args.tabId}" not found in document.`);
+            }
+            if (!targetTab.documentTab) {
+                throw new UserError(`Tab "${args.tabId}" does not have content (may not be a document tab).`);
+            }
+            contentSource = { body: targetTab.documentTab.body };
+            log.info(`Using content from tab: ${targetTab.tabProperties?.title || 'Untitled'}`);
+        } else {
+            // Use the document body (backward compatible)
+            contentSource = res.data;
+        }
 
         if (args.format === 'json') {
-            const jsonContent = JSON.stringify(res.data, null, 2);
+            const jsonContent = JSON.stringify(contentSource, null, 2);
             // Apply length limit to JSON if specified
             if (args.maxLength && jsonContent.length > args.maxLength) {
                 return jsonContent.substring(0, args.maxLength) + `\n... [JSON truncated: ${jsonContent.length} total chars]`;
@@ -292,42 +314,42 @@ log.info(`Reading Google Doc: ${args.documentId}, Format: ${args.format}`);
         }
 
         if (args.format === 'markdown') {
-            const markdownContent = convertDocsJsonToMarkdown(res.data);
+            const markdownContent = convertDocsJsonToMarkdown(contentSource);
             const totalLength = markdownContent.length;
             log.info(`Generated markdown: ${totalLength} characters`);
-            
+
             // Apply length limit to markdown if specified
             if (args.maxLength && totalLength > args.maxLength) {
                 const truncatedContent = markdownContent.substring(0, args.maxLength);
                 return `${truncatedContent}\n\n... [Markdown truncated to ${args.maxLength} chars of ${totalLength} total. Use maxLength parameter to adjust limit or remove it to get full content.]`;
             }
-            
+
             return markdownContent;
         }
 
         // Default: Text format - extract all text content
         let textContent = '';
         let elementCount = 0;
-        
-        // Process all content elements
-        res.data.body?.content?.forEach(element => {
+
+        // Process all content elements from contentSource
+        contentSource.body?.content?.forEach((element: any) => {
             elementCount++;
-            
+
             // Handle paragraphs
             if (element.paragraph?.elements) {
-                element.paragraph.elements.forEach(pe => {
+                element.paragraph.elements.forEach((pe: any) => {
                     if (pe.textRun?.content) {
                         textContent += pe.textRun.content;
                     }
                 });
             }
-            
+
             // Handle tables
             if (element.table?.tableRows) {
-                element.table.tableRows.forEach(row => {
-                    row.tableCells?.forEach(cell => {
-                        cell.content?.forEach(cellElement => {
-                            cellElement.paragraph?.elements?.forEach(pe => {
+                element.table.tableRows.forEach((row: any) => {
+                    row.tableCells?.forEach((cell: any) => {
+                        cell.content?.forEach((cellElement: any) => {
+                            cellElement.paragraph?.elements?.forEach((pe: any) => {
                                 if (pe.textRun?.content) {
                                     textContent += pe.textRun.content;
                                 }
@@ -355,7 +377,7 @@ log.info(`Reading Google Doc: ${args.documentId}, Format: ${args.format}`);
         const fullResponse = `Content (${totalLength} characters):\n---\n${textContent}`;
         const responseLength = fullResponse.length;
         log.info(`Returning full content: ${responseLength} characters in response (${totalLength} content + ${responseLength - totalLength} metadata)`);
-        
+
         return fullResponse;
 
     } catch (error: any) {
@@ -370,6 +392,104 @@ log.info(`Reading Google Doc: ${args.documentId}, Format: ${args.format}`);
     }
 
 },
+});
+
+server.addTool({
+name: 'listDocumentTabs',
+description: 'Lists all tabs in a Google Document, including their hierarchy, IDs, and structure.',
+parameters: DocumentIdParameter.extend({
+  includeContent: z.boolean().optional().default(false)
+    .describe('Whether to include a content summary for each tab (character count).')
+}),
+execute: async (args, { log }) => {
+  const docs = await getDocsClient();
+  log.info(`Listing tabs for document: ${args.documentId}`);
+
+  try {
+    // Get document with tabs structure
+    const res = await docs.documents.get({
+      documentId: args.documentId,
+      includeTabsContent: true,
+      // Only get essential fields for tab listing
+      fields: args.includeContent
+        ? 'title,tabs'  // Get all tab data if we need content summary
+        : 'title,tabs(tabProperties,childTabs)'  // Otherwise just structure
+    });
+
+    const docTitle = res.data.title || 'Untitled Document';
+
+    // Get all tabs in a flat list with hierarchy info
+    const allTabs = GDocsHelpers.getAllTabs(res.data);
+
+    if (allTabs.length === 0) {
+      // Shouldn't happen with new structure, but handle edge case
+      return `Document "${docTitle}" appears to have no tabs (unexpected).`;
+    }
+
+    // Check if it's a single-tab or multi-tab document
+    const isSingleTab = allTabs.length === 1;
+
+    // Format the output
+    let result = `**Document:** "${docTitle}"\n`;
+    result += `**Total tabs:** ${allTabs.length}`;
+    result += isSingleTab ? ' (single-tab document)\n\n' : '\n\n';
+
+    if (!isSingleTab) {
+      result += `**Tab Structure:**\n`;
+      result += `${'─'.repeat(50)}\n\n`;
+    }
+
+    allTabs.forEach((tabInfo: any, index: number) => {
+      const tab = tabInfo;
+      const level = tabInfo.level;
+      const indent = '  '.repeat(level);
+      const tabProps = tab.tabProperties || {};
+
+      // For single tab documents, show simplified info
+      if (isSingleTab) {
+        result += `**Default Tab:**\n`;
+        result += `- Tab ID: ${tabProps.tabId || 'Unknown'}\n`;
+        result += `- Title: ${tabProps.title || '(Untitled)'}\n`;
+      } else {
+        // For multi-tab documents, show hierarchy
+        const prefix = level > 0 ? '└─ ' : '';
+        result += `${indent}${prefix}**Tab ${index + 1}:** "${tabProps.title || 'Untitled Tab'}"\n`;
+        result += `${indent}   - ID: ${tabProps.tabId || 'Unknown'}\n`;
+        result += `${indent}   - Index: ${tabProps.index !== undefined ? tabProps.index : 'N/A'}\n`;
+
+        if (tabProps.parentTabId) {
+          result += `${indent}   - Parent Tab ID: ${tabProps.parentTabId}\n`;
+        }
+      }
+
+      // Optionally include content summary
+      if (args.includeContent && tab.documentTab) {
+        const textLength = GDocsHelpers.getTabTextLength(tab.documentTab);
+        const contentInfo = textLength > 0
+          ? `${textLength.toLocaleString()} characters`
+          : 'Empty';
+        result += `${indent}   - Content: ${contentInfo}\n`;
+      }
+
+      if (!isSingleTab) {
+        result += '\n';
+      }
+    });
+
+    // Add usage hint for multi-tab documents
+    if (!isSingleTab) {
+      result += `\n💡 **Tip:** Use tab IDs with other tools to target specific tabs.`;
+    }
+
+    return result;
+
+  } catch (error: any) {
+    log.error(`Error listing tabs for doc ${args.documentId}: ${error.message || error}`);
+    if (error.code === 404) throw new UserError(`Document not found (ID: ${args.documentId}).`);
+    if (error.code === 403) throw new UserError(`Permission denied for document (ID: ${args.documentId}).`);
+    throw new UserError(`Failed to list tabs: ${error.message || 'Unknown error'}`);
+  }
+}
 });
 
 server.addTool({
@@ -848,11 +968,11 @@ server.addTool({
     log.info(`Listing comments for document ${args.documentId}`);
     const docsClient = await getDocsClient();
     const driveClient = await getDriveClient();
-    
+
     try {
       // First get the document to have context
       const doc = await docsClient.documents.get({ documentId: args.documentId });
-      
+
       // Use Drive API v3 with proper fields to get quoted content
       const drive = google.drive({ version: 'v3', auth: authClient! });
       const response = await drive.comments.list({
@@ -860,37 +980,37 @@ server.addTool({
         fields: 'comments(id,content,quotedFileContent,author,createdTime,resolved)',
         pageSize: 100
       });
-      
+
       const comments = response.data.comments || [];
-      
+
       if (comments.length === 0) {
         return 'No comments found in this document.';
       }
-      
+
       // Format comments for display
       const formattedComments = comments.map((comment: any, index: number) => {
         const replies = comment.replies?.length || 0;
         const status = comment.resolved ? ' [RESOLVED]' : '';
         const author = comment.author?.displayName || 'Unknown';
         const date = comment.createdTime ? new Date(comment.createdTime).toLocaleDateString() : 'Unknown date';
-        
+
         // Get the actual quoted text content
         const quotedText = comment.quotedFileContent?.value || 'No quoted text';
         const anchor = quotedText !== 'No quoted text' ? ` (anchored to: "${quotedText.substring(0, 100)}${quotedText.length > 100 ? '...' : ''}")` : '';
-        
+
         let result = `\n${index + 1}. **${author}** (${date})${status}${anchor}\n   ${comment.content}`;
-        
+
         if (replies > 0) {
           result += `\n   └─ ${replies} ${replies === 1 ? 'reply' : 'replies'}`;
         }
-        
+
         result += `\n   Comment ID: ${comment.id}`;
-        
+
         return result;
       }).join('\n');
-      
+
       return `Found ${comments.length} comment${comments.length === 1 ? '' : 's'}:\n${formattedComments}`;
-      
+
     } catch (error: any) {
       log.error(`Error listing comments: ${error.message || error}`);
       throw new UserError(`Failed to list comments: ${error.message || 'Unknown error'}`);
@@ -906,7 +1026,7 @@ server.addTool({
   }),
   execute: async (args, { log }) => {
     log.info(`Getting comment ${args.commentId} from document ${args.documentId}`);
-    
+
     try {
       const drive = google.drive({ version: 'v3', auth: authClient! });
       const response = await drive.comments.get({
@@ -914,16 +1034,16 @@ server.addTool({
         commentId: args.commentId,
         fields: 'id,content,quotedFileContent,author,createdTime,resolved,replies(id,content,author,createdTime)'
       });
-      
+
       const comment = response.data;
       const author = comment.author?.displayName || 'Unknown';
       const date = comment.createdTime ? new Date(comment.createdTime).toLocaleDateString() : 'Unknown date';
       const status = comment.resolved ? ' [RESOLVED]' : '';
       const quotedText = comment.quotedFileContent?.value || 'No quoted text';
       const anchor = quotedText !== 'No quoted text' ? `\nAnchored to: "${quotedText}"` : '';
-      
+
       let result = `**${author}** (${date})${status}${anchor}\n${comment.content}`;
-      
+
       // Add replies if any
       if (comment.replies && comment.replies.length > 0) {
         result += '\n\n**Replies:**';
@@ -933,9 +1053,9 @@ server.addTool({
           result += `\n${index + 1}. **${replyAuthor}** (${replyDate})\n   ${reply.content}`;
         });
       }
-      
+
       return result;
-      
+
     } catch (error: any) {
       log.error(`Error getting comment: ${error.message || error}`);
       throw new UserError(`Failed to get comment: ${error.message || 'Unknown error'}`);
@@ -956,16 +1076,16 @@ server.addTool({
   }),
   execute: async (args, { log }) => {
     log.info(`Adding comment to range ${args.startIndex}-${args.endIndex} in doc ${args.documentId}`);
-    
+
     try {
       // First, get the text content that will be quoted
       const docsClient = await getDocsClient();
       const doc = await docsClient.documents.get({ documentId: args.documentId });
-      
+
       // Extract the quoted text from the document
       let quotedText = '';
       const content = doc.data.body?.content || [];
-      
+
       for (const element of content) {
         if (element.paragraph) {
           const elements = element.paragraph.elements || [];
@@ -973,7 +1093,7 @@ server.addTool({
             if (textElement.textRun) {
               const elementStart = textElement.startIndex || 0;
               const elementEnd = textElement.endIndex || 0;
-              
+
               // Check if this element overlaps with our range
               if (elementEnd > args.startIndex && elementStart < args.endIndex) {
                 const text = textElement.textRun.content || '';
@@ -985,10 +1105,10 @@ server.addTool({
           }
         }
       }
-      
+
       // Use Drive API v3 for comments
       const drive = google.drive({ version: 'v3', auth: authClient! });
-      
+
       const response = await drive.comments.create({
         fileId: args.documentId,
         fields: 'id,content,quotedFileContent,author,createdTime,resolved',
@@ -1010,9 +1130,9 @@ server.addTool({
           })
         }
       });
-      
+
       return `Comment added successfully. Comment ID: ${response.data.id}`;
-      
+
     } catch (error: any) {
       log.error(`Error adding comment: ${error.message || error}`);
       throw new UserError(`Failed to add comment: ${error.message || 'Unknown error'}`);
@@ -1029,10 +1149,10 @@ server.addTool({
   }),
   execute: async (args, { log }) => {
     log.info(`Adding reply to comment ${args.commentId} in doc ${args.documentId}`);
-    
+
     try {
       const drive = google.drive({ version: 'v3', auth: authClient! });
-      
+
       const response = await drive.replies.create({
         fileId: args.documentId,
         commentId: args.commentId,
@@ -1041,9 +1161,9 @@ server.addTool({
           content: args.replyText
         }
       });
-      
+
       return `Reply added successfully. Reply ID: ${response.data.id}`;
-      
+
     } catch (error: any) {
       log.error(`Error adding reply: ${error.message || error}`);
       throw new UserError(`Failed to add reply: ${error.message || 'Unknown error'}`);
@@ -1059,10 +1179,10 @@ server.addTool({
   }),
   execute: async (args, { log }) => {
     log.info(`Resolving comment ${args.commentId} in doc ${args.documentId}`);
-    
+
     try {
       const drive = google.drive({ version: 'v3', auth: authClient! });
-      
+
       await drive.comments.update({
         fileId: args.documentId,
         commentId: args.commentId,
@@ -1070,9 +1190,9 @@ server.addTool({
           resolved: true
         }
       });
-      
+
       return `Comment ${args.commentId} has been resolved.`;
-      
+
     } catch (error: any) {
       log.error(`Error resolving comment: ${error.message || error}`);
       throw new UserError(`Failed to resolve comment: ${error.message || 'Unknown error'}`);
@@ -1088,17 +1208,17 @@ server.addTool({
   }),
   execute: async (args, { log }) => {
     log.info(`Deleting comment ${args.commentId} from doc ${args.documentId}`);
-    
+
     try {
       const drive = google.drive({ version: 'v3', auth: authClient! });
-      
+
       await drive.comments.delete({
         fileId: args.documentId,
         commentId: args.commentId
       });
-      
+
       return `Comment ${args.commentId} has been deleted.`;
-      
+
     } catch (error: any) {
       log.error(`Error deleting comment: ${error.message || error}`);
       throw new UserError(`Failed to delete comment: ${error.message || 'Unknown error'}`);

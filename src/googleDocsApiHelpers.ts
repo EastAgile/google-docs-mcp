@@ -66,7 +66,7 @@ try {
     // More robust text collection and index tracking
     let fullText = '';
     const segments: { text: string, start: number, end: number }[] = [];
-    
+
     // Process all content elements, including structural ones
     const collectTextFromContent = (content: any[]) => {
         content.forEach(element => {
@@ -76,15 +76,15 @@ try {
                     if (pe.textRun?.content && pe.startIndex !== undefined && pe.endIndex !== undefined) {
                         const content = pe.textRun.content;
                         fullText += content;
-                        segments.push({ 
-                            text: content, 
-                            start: pe.startIndex, 
-                            end: pe.endIndex 
+                        segments.push({
+                            text: content,
+                            start: pe.startIndex,
+                            end: pe.endIndex
                         });
                     }
                 });
             }
-            
+
             // Handle table elements - this is simplified and might need expansion
             if (element.table && element.table.tableRows) {
                 element.table.tableRows.forEach((row: any) => {
@@ -97,18 +97,18 @@ try {
                     }
                 });
             }
-            
+
             // Add handling for other structural elements as needed
         });
     };
-    
+
     collectTextFromContent(res.data.body.content);
-    
+
     // Sort segments by starting position to ensure correct ordering
     segments.sort((a, b) => a.start - b.start);
-    
+
     console.log(`Document ${documentId} contains ${segments.length} text segments and ${fullText.length} characters in total.`);
-    
+
     // Find the specified instance of the text
     let startIndex = -1;
     let endIndex = -1;
@@ -124,12 +124,12 @@ try {
 
         foundCount++;
         console.log(`Found instance ${foundCount} of "${textToFind}" at position ${currentIndex} in full text`);
-        
+
         if (foundCount === instance) {
             const targetStartInFullText = currentIndex;
             const targetEndInFullText = currentIndex + textToFind.length;
             let currentPosInFullText = 0;
-            
+
             console.log(`Target text range in full text: ${targetStartInFullText}-${targetEndInFullText}`);
 
             for (const seg of segments) {
@@ -142,30 +142,30 @@ try {
                     startIndex = seg.start + (targetStartInFullText - segStartInFullText);
                     console.log(`Mapped start to segment ${seg.start}-${seg.end}, position ${startIndex}`);
                 }
-                
+
                 if (targetEndInFullText > segStartInFullText && targetEndInFullText <= segEndInFullText) {
                     endIndex = seg.start + (targetEndInFullText - segStartInFullText);
                     console.log(`Mapped end to segment ${seg.start}-${seg.end}, position ${endIndex}`);
                     break;
                 }
-                
+
                 currentPosInFullText = segEndInFullText;
             }
 
             if (startIndex === -1 || endIndex === -1) {
                 console.warn(`Failed to map text "${textToFind}" instance ${instance} to actual document indices`);
                 // Reset and try next occurrence
-                startIndex = -1; 
+                startIndex = -1;
                 endIndex = -1;
                 searchStartIndex = currentIndex + 1;
                 foundCount--;
                 continue;
             }
-            
+
             console.log(`Successfully mapped "${textToFind}" to document range ${startIndex}-${endIndex}`);
             return { startIndex, endIndex };
         }
-        
+
         // Prepare for next search iteration
         searchStartIndex = currentIndex + 1;
     }
@@ -185,7 +185,7 @@ try {
 export async function getParagraphRange(docs: Docs, documentId: string, indexWithin: number): Promise<{ startIndex: number; endIndex: number } | null> {
 try {
     console.log(`Finding paragraph containing index ${indexWithin} in document ${documentId}`);
-    
+
     // Request more detailed document structure to handle nested elements
     const res = await docs.documents.get({
         documentId,
@@ -209,12 +209,12 @@ try {
                     // If it's a paragraph, we've found our target
                     if (element.paragraph) {
                         console.log(`Found paragraph containing index ${indexWithin}, range: ${element.startIndex}-${element.endIndex}`);
-                        return { 
-                            startIndex: element.startIndex, 
-                            endIndex: element.endIndex 
+                        return {
+                            startIndex: element.startIndex,
+                            endIndex: element.endIndex
                         };
                     }
-                    
+
                     // If it's a table, we need to check cells recursively
                     if (element.table && element.table.tableRows) {
                         console.log(`Index ${indexWithin} is within a table, searching cells...`);
@@ -229,25 +229,25 @@ try {
                             }
                         }
                     }
-                    
+
                     // For other structural elements, we didn't find a paragraph
                     // but we know the index is within this element
                     console.warn(`Index ${indexWithin} is within element (${element.startIndex}-${element.endIndex}) but not in a paragraph`);
                 }
             }
         }
-        
+
         return null;
     };
 
     const paragraphRange = findParagraphInContent(res.data.body.content);
-    
+
     if (!paragraphRange) {
         console.warn(`Could not find paragraph containing index ${indexWithin}`);
     } else {
         console.log(`Returning paragraph range: ${paragraphRange.startIndex}-${paragraphRange.endIndex}`);
     }
-    
+
     return paragraphRange;
 
 } catch (error: any) {
@@ -314,49 +314,49 @@ style: ParagraphStyleArgs
     console.log(`Building paragraph style request for range ${startIndex}-${endIndex} with options:`, style);
 
     // Process alignment option (LEFT, CENTER, RIGHT, JUSTIFIED)
-    if (style.alignment !== undefined) { 
-        paragraphStyle.alignment = style.alignment; 
-        fieldsToUpdate.push('alignment'); 
+    if (style.alignment !== undefined) {
+        paragraphStyle.alignment = style.alignment;
+        fieldsToUpdate.push('alignment');
         console.log(`Setting alignment to ${style.alignment}`);
     }
-    
+
     // Process indentation options
-    if (style.indentStart !== undefined) { 
-        paragraphStyle.indentStart = { magnitude: style.indentStart, unit: 'PT' }; 
-        fieldsToUpdate.push('indentStart'); 
+    if (style.indentStart !== undefined) {
+        paragraphStyle.indentStart = { magnitude: style.indentStart, unit: 'PT' };
+        fieldsToUpdate.push('indentStart');
         console.log(`Setting left indent to ${style.indentStart}pt`);
     }
-    
-    if (style.indentEnd !== undefined) { 
-        paragraphStyle.indentEnd = { magnitude: style.indentEnd, unit: 'PT' }; 
-        fieldsToUpdate.push('indentEnd'); 
+
+    if (style.indentEnd !== undefined) {
+        paragraphStyle.indentEnd = { magnitude: style.indentEnd, unit: 'PT' };
+        fieldsToUpdate.push('indentEnd');
         console.log(`Setting right indent to ${style.indentEnd}pt`);
     }
-    
+
     // Process spacing options
-    if (style.spaceAbove !== undefined) { 
-        paragraphStyle.spaceAbove = { magnitude: style.spaceAbove, unit: 'PT' }; 
-        fieldsToUpdate.push('spaceAbove'); 
+    if (style.spaceAbove !== undefined) {
+        paragraphStyle.spaceAbove = { magnitude: style.spaceAbove, unit: 'PT' };
+        fieldsToUpdate.push('spaceAbove');
         console.log(`Setting space above to ${style.spaceAbove}pt`);
     }
-    
-    if (style.spaceBelow !== undefined) { 
-        paragraphStyle.spaceBelow = { magnitude: style.spaceBelow, unit: 'PT' }; 
-        fieldsToUpdate.push('spaceBelow'); 
+
+    if (style.spaceBelow !== undefined) {
+        paragraphStyle.spaceBelow = { magnitude: style.spaceBelow, unit: 'PT' };
+        fieldsToUpdate.push('spaceBelow');
         console.log(`Setting space below to ${style.spaceBelow}pt`);
     }
-    
+
     // Process named style types (headings, etc.)
-    if (style.namedStyleType !== undefined) { 
-        paragraphStyle.namedStyleType = style.namedStyleType; 
-        fieldsToUpdate.push('namedStyleType'); 
+    if (style.namedStyleType !== undefined) {
+        paragraphStyle.namedStyleType = style.namedStyleType;
+        fieldsToUpdate.push('namedStyleType');
         console.log(`Setting named style to ${style.namedStyleType}`);
     }
-    
+
     // Process page break control
-    if (style.keepWithNext !== undefined) { 
-        paragraphStyle.keepWithNext = style.keepWithNext; 
-        fieldsToUpdate.push('keepWithNext'); 
+    if (style.keepWithNext !== undefined) {
+        paragraphStyle.keepWithNext = style.keepWithNext;
+        fieldsToUpdate.push('keepWithNext');
         console.log(`Setting keepWithNext to ${style.keepWithNext}`);
     }
 
@@ -374,7 +374,7 @@ style: ParagraphStyleArgs
             fields: fieldsToUpdate.join(','),
         }
     };
-    
+
     console.log(`Created paragraph style request with fields: ${fieldsToUpdate.join(', ')}`);
     return { request, fields: fieldsToUpdate };
 }
@@ -596,4 +596,90 @@ export async function uploadImageToDrive(
     }
 
     return webContentLink;
+}
+
+// --- Tab Management Helpers ---
+
+/**
+ * Recursively collect all tabs from a document in a flat list with hierarchy info
+ * @param doc - The Google Doc document object
+ * @returns Array of tabs with nesting level information
+ */
+export function getAllTabs(doc: docs_v1.Schema$Document): any[] {
+    const allTabs: any[] = [];
+    if (!doc.tabs || doc.tabs.length === 0) {
+        return allTabs;
+    }
+
+    for (const tab of doc.tabs) {
+        addCurrentAndChildTabs(tab, allTabs, 0);
+    }
+    return allTabs;
+}
+
+/**
+ * Recursive helper to add tabs with their nesting level
+ * @param tab - The tab to add
+ * @param allTabs - The accumulator array
+ * @param level - Current nesting level (0 for top-level)
+ */
+function addCurrentAndChildTabs(tab: any, allTabs: any[], level: number): void {
+    allTabs.push({ ...tab, level });
+    if (tab.childTabs && tab.childTabs.length > 0) {
+        for (const childTab of tab.childTabs) {
+            addCurrentAndChildTabs(childTab, allTabs, level + 1);
+        }
+    }
+}
+
+/**
+ * Get the text length from a DocumentTab
+ * @param documentTab - The DocumentTab object
+ * @returns Total character count
+ */
+export function getTabTextLength(documentTab: any): number {
+    let totalLength = 0;
+
+    if (documentTab?.body?.content) {
+        documentTab.body.content.forEach((element: any) => {
+            if (element.paragraph?.elements) {
+                element.paragraph.elements.forEach((pe: any) => {
+                    if (pe.textRun?.content) {
+                        totalLength += pe.textRun.content.length;
+                    }
+                });
+            }
+        });
+    }
+
+    return totalLength;
+}
+
+/**
+ * Find a specific tab by ID in a document (searches recursively through child tabs)
+ * @param doc - The Google Doc document object
+ * @param tabId - The tab ID to search for
+ * @returns The tab object if found, null otherwise
+ */
+export function findTabById(doc: docs_v1.Schema$Document, tabId: string): any {
+    if (!doc.tabs || doc.tabs.length === 0) {
+        return null;
+    }
+
+    // Helper function to search through tabs recursively
+    const searchTabs = (tabs: any[]): any => {
+        for (const tab of tabs) {
+            if (tab.tabProperties?.tabId === tabId) {
+                return tab;
+            }
+            // Recursively search child tabs
+            if (tab.childTabs && tab.childTabs.length > 0) {
+                const found = searchTabs(tab.childTabs);
+                if (found) return found;
+            }
+        }
+        return null;
+    };
+
+    return searchTabs(doc.tabs);
 }
