@@ -868,29 +868,65 @@ tableStartIndex: z.number().int().min(1).describe("The starting index of the TAB
 rowIndex: z.number().int().min(0).describe("Row index (0-based)."),
 columnIndex: z.number().int().min(0).describe("Column index (0-based)."),
 textContent: z.string().optional().describe("Optional: New text content for the cell. Replaces existing content."),
-// Combine basic styles for simplicity here. More advanced cell styling might need separate tools.
 textStyle: TextStyleParameters.optional().describe("Optional: Text styles to apply."),
 paragraphStyle: ParagraphStyleParameters.optional().describe("Optional: Paragraph styles (like alignment) to apply."),
-// cellBackgroundColor: z.string().optional()... // Cell-specific styles are complex
 }),
 execute: async (args, { log }) => {
 const docs = await getDocsClient();
 log.info(`Editing cell (${args.rowIndex}, ${args.columnIndex}) in table starting at ${args.tableStartIndex}, doc ${args.documentId}`);
 
-        // TODO: Implement complex logic
-        // 1. Find the cell's content range based on tableStartIndex, rowIndex, columnIndex. This is NON-TRIVIAL.
-        //    Requires getting the document, finding the table element, iterating through rows/cells to calculate indices.
-        // 2. If textContent is provided, generate a DeleteContentRange request for the cell's current content.
-        // 3. Generate an InsertText request for the new textContent at the cell's start index.
-        // 4. If textStyle is provided, generate UpdateTextStyle requests for the new text range.
-        // 5. If paragraphStyle is provided, generate UpdateParagraphStyle requests for the cell's paragraph range.
-        // 6. Execute batch update.
-
-        log.error("editTableCell is not implemented due to complexity of finding cell indices.");
-        throw new NotImplementedError("Editing table cells is complex and not yet implemented.");
-        // return `Edit request for cell (${args.rowIndex}, ${args.columnIndex}) submitted (Not Implemented).`;
+        try {
+            const result = await GDocsHelpers.editTableCell(
+                docs,
+                args.documentId,
+                args.tableStartIndex,
+                args.rowIndex,
+                args.columnIndex,
+                args.textContent,
+                args.textStyle,
+                args.paragraphStyle
+            );
+            return result.message;
+        } catch (error: any) {
+            log.error(`Error editing table cell: ${error.message || error}`);
+            if (error instanceof UserError) throw error;
+            throw new UserError(`Failed to edit table cell: ${error.message || 'Unknown error'}`);
+        }
     }
 
+});
+
+server.addTool({
+name: 'createTableWithData',
+description: 'Creates a table and populates it with data in one efficient operation. Much faster than insertTable + multiple editTableCell calls.',
+parameters: DocumentIdParameter.extend({
+index: z.number().int().min(1).describe('The index (1-based) where the table should be inserted.'),
+headers: z.array(z.string()).min(1).describe('Array of header strings for the table columns.'),
+rows: z.array(z.array(z.string())).describe('2D array of row data. Each inner array is a row.'),
+boldHeaders: z.boolean().optional().default(true).describe('Whether to bold the header row (default: true).'),
+boldTotalRow: z.boolean().optional().default(true).describe('Whether to bold rows containing "Total" in first column (default: true).'),
+}),
+execute: async (args, { log }) => {
+const docs = await getDocsClient();
+log.info(`Creating table with data in doc ${args.documentId} at index ${args.index}: ${args.headers.length} cols, ${args.rows.length} rows`);
+
+        try {
+            const result = await GDocsHelpers.createTableWithData(
+                docs,
+                args.documentId,
+                args.index,
+                args.headers,
+                args.rows,
+                args.boldHeaders,
+                args.boldTotalRow
+            );
+            return result.message;
+        } catch (error: any) {
+            log.error(`Error creating table with data: ${error.message || error}`);
+            if (error instanceof UserError) throw error;
+            throw new UserError(`Failed to create table with data: ${error.message || 'Unknown error'}`);
+        }
+    }
 });
 
 server.addTool({
@@ -1343,16 +1379,54 @@ server.addTool({
 // Example Stub:
 server.addTool({
 name: 'findElement',
-description: 'Finds elements (paragraphs, tables, etc.) based on various criteria. (Not Implemented)',
+description: 'Finds elements (paragraphs, tables, etc.) based on text search. Returns the start and end indices of the found text, useful for inserting tables or other content after specific text.',
 parameters: DocumentIdParameter.extend({
-// Define complex query parameters...
-textQuery: z.string().optional(),
-elementType: z.enum(['paragraph', 'table', 'list', 'image']).optional(),
-// styleQuery...
+  textQuery: z.string().min(1).describe('The text to search for in the document.'),
+  matchInstance: z.number().int().min(1).optional().default(1).describe('Which instance of the text to find (1st, 2nd, etc.). Defaults to 1.'),
+  returnParagraphBoundaries: z.boolean().optional().default(false).describe('If true, returns the boundaries of the entire paragraph containing the text, not just the text itself.'),
 }),
 execute: async (args, { log }) => {
-log.warn("findElement tool called but is not implemented.");
-throw new NotImplementedError("Finding elements by complex criteria is not yet implemented.");
+  const docs = await getDocsClient();
+  log.info(`Finding element in doc ${args.documentId}: "${args.textQuery}" (instance ${args.matchInstance})`);
+
+  try {
+    // Find the text range
+    const textRange = await GDocsHelpers.findTextRange(docs, args.documentId, args.textQuery, args.matchInstance);
+
+    if (!textRange) {
+      return JSON.stringify({
+        found: false,
+        message: `Could not find instance ${args.matchInstance} of text "${args.textQuery}" in the document.`
+      });
+    }
+
+    let result: any = {
+      found: true,
+      textQuery: args.textQuery,
+      matchInstance: args.matchInstance,
+      startIndex: textRange.startIndex,
+      endIndex: textRange.endIndex,
+      insertAfterIndex: textRange.endIndex, // Convenient: index to insert content AFTER this text
+    };
+
+    // If requested, also find the paragraph boundaries
+    if (args.returnParagraphBoundaries) {
+      const paragraphRange = await GDocsHelpers.getParagraphRange(docs, args.documentId, textRange.startIndex);
+      if (paragraphRange) {
+        result.paragraphStartIndex = paragraphRange.startIndex;
+        result.paragraphEndIndex = paragraphRange.endIndex;
+        result.insertAfterParagraphIndex = paragraphRange.endIndex; // Index to insert after entire paragraph
+      }
+    }
+
+    log.info(`Found "${args.textQuery}" at indices ${textRange.startIndex}-${textRange.endIndex}`);
+    return JSON.stringify(result, null, 2);
+
+  } catch (error: any) {
+    log.error(`Error finding element in doc ${args.documentId}: ${error.message || error}`);
+    if (error instanceof UserError) throw error;
+    throw new UserError(`Failed to find element: ${error.message || 'Unknown error'}`);
+  }
 }
 });
 

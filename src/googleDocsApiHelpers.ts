@@ -429,17 +429,204 @@ documentId: string,
 startIndex?: number,
 endIndex?: number
 ): Promise<docs_v1.Schema$BatchUpdateDocumentResponse> {
-// TODO: Implement complex logic
-// 1. Get document content (paragraphs, text runs) in the specified range (or whole doc).
-// 2. Iterate through paragraphs.
-// 3. Identify sequences of paragraphs starting with list-like markers (e.g., "-", "*", "1.", "a)").
-// 4. Determine nesting levels based on indentation or marker patterns.
-// 5. Generate CreateParagraphBulletsRequests for the identified sequences.
-// 6. Potentially delete the original marker text.
-// 7. Execute the batch update.
-console.warn("detectAndFormatLists is not implemented.");
-throw new NotImplementedError("Automatic list detection and formatting is not yet implemented.");
-// return {};
+    console.log(`detectAndFormatLists called for doc ${documentId}, range: ${startIndex}-${endIndex}`);
+
+    // Get document content to analyze paragraphs
+    const res = await docs.documents.get({
+        documentId,
+        fields: 'body(content(startIndex,endIndex,paragraph(elements(textRun(content)))))',
+    });
+
+    if (!res.data.body?.content) {
+        throw new UserError("Document has no content to format.");
+    }
+
+    const requests: docs_v1.Schema$Request[] = [];
+    const processedRanges: { start: number; end: number; bulletType: string }[] = [];
+
+    // Analyze each paragraph in the document
+    for (const element of res.data.body.content) {
+        if (!element.paragraph || element.startIndex === undefined || element.startIndex === null ||
+            element.endIndex === undefined || element.endIndex === null) {
+            continue;
+        }
+
+        const paragraphStart: number = element.startIndex;
+        const paragraphEnd: number = element.endIndex;
+
+        // Skip if outside specified range
+        if (startIndex !== undefined && paragraphEnd <= startIndex) continue;
+        if (endIndex !== undefined && paragraphStart >= endIndex) continue;
+
+        // Get paragraph text content
+        let paragraphText = '';
+        element.paragraph.elements?.forEach((pe: any) => {
+            if (pe.textRun?.content) {
+                paragraphText += pe.textRun.content;
+            }
+        });
+
+        // Check for list-like patterns at the start of the paragraph
+        const trimmedText = paragraphText.trimStart();
+        let bulletPreset: string | null = null;
+        let markerLength = 0;
+
+        // Check for bullet markers: -, *, •
+        if (/^[-*•]\s/.test(trimmedText)) {
+            bulletPreset = 'BULLET_DISC_CIRCLE_SQUARE';
+            markerLength = trimmedText.match(/^[-*•]\s*/)?.[0].length || 0;
+        }
+        // Check for numbered list markers: 1. 2. 3. or 1) 2) 3)
+        else if (/^\d+[.)]\s/.test(trimmedText)) {
+            bulletPreset = 'NUMBERED_DECIMAL_NESTED';
+            markerLength = trimmedText.match(/^\d+[.)]\s*/)?.[0].length || 0;
+        }
+        // Check for lettered list markers: a. b. c. or a) b) c)
+        else if (/^[a-zA-Z][.)]\s/.test(trimmedText)) {
+            bulletPreset = 'NUMBERED_UPPERALPHA_ALPHA_ROMAN';
+            markerLength = trimmedText.match(/^[a-zA-Z][.)]\s*/)?.[0].length || 0;
+        }
+
+        if (bulletPreset) {
+            const leadingSpaces = paragraphText.length - paragraphText.trimStart().length;
+
+            processedRanges.push({
+                start: paragraphStart,
+                end: paragraphEnd,
+                bulletType: bulletPreset
+            });
+
+            // First, create the bullet for this paragraph
+            requests.push({
+                createParagraphBullets: {
+                    range: {
+                        startIndex: paragraphStart,
+                        endIndex: paragraphEnd
+                    },
+                    bulletPreset: bulletPreset as any
+                }
+            });
+        }
+    }
+
+    if (requests.length === 0) {
+        console.log("No list-like paragraphs found to format.");
+        return {};
+    }
+
+    console.log(`Found ${requests.length} paragraphs to convert to lists.`);
+
+    // Execute the batch update to create bullets
+    const result = await executeBatchUpdate(docs, documentId, requests);
+
+    // Now we need to delete the marker text from each paragraph
+    // We need to do this in reverse order to maintain correct indices
+    const deleteRequests: docs_v1.Schema$Request[] = [];
+
+    // Re-fetch document to get updated indices after bullet creation
+    const updatedDoc = await docs.documents.get({
+        documentId,
+        fields: 'body(content(startIndex,endIndex,paragraph(elements(textRun(content)))))',
+    });
+
+    if (updatedDoc.data.body?.content) {
+        for (const element of updatedDoc.data.body.content) {
+            if (!element.paragraph || element.startIndex === undefined || element.startIndex === null) continue;
+
+            let paragraphText = '';
+            let textStartIndex: number = element.startIndex;
+
+            element.paragraph.elements?.forEach((pe: any) => {
+                if (pe.textRun?.content && pe.startIndex !== undefined && pe.startIndex !== null) {
+                    if (paragraphText === '') {
+                        textStartIndex = pe.startIndex as number;
+                    }
+                    paragraphText += pe.textRun.content;
+                }
+            });
+
+            const trimmedText = paragraphText.trimStart();
+            const leadingSpaces = paragraphText.length - trimmedText.length;
+
+            let markerMatch = trimmedText.match(/^([-*•]\s*|\d+[.)]\s*|[a-zA-Z][.)]\s*)/);
+            if (markerMatch) {
+                const markerLength = markerMatch[0].length;
+                const deleteStart: number = textStartIndex + leadingSpaces;
+                const deleteEnd: number = deleteStart + markerLength;
+
+                deleteRequests.push({
+                    deleteContentRange: {
+                        range: {
+                            startIndex: deleteStart,
+                            endIndex: deleteEnd
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    // Execute delete requests in reverse order (to maintain indices)
+    if (deleteRequests.length > 0) {
+        deleteRequests.reverse();
+        await executeBatchUpdate(docs, documentId, deleteRequests);
+        console.log(`Deleted ${deleteRequests.length} marker texts.`);
+    }
+
+    return result;
+}
+
+/**
+ * Converts paragraphs in a range to a bullet list (without needing markers)
+ * @param docs - Google Docs API client
+ * @param documentId - The document ID
+ * @param startIndex - Start of range
+ * @param endIndex - End of range
+ * @param bulletPreset - Type of bullet list (default: BULLET_DISC_CIRCLE_SQUARE)
+ */
+export async function createBulletListInRange(
+    docs: Docs,
+    documentId: string,
+    startIndex: number,
+    endIndex: number,
+    bulletPreset: string = 'BULLET_DISC_CIRCLE_SQUARE'
+): Promise<docs_v1.Schema$BatchUpdateDocumentResponse> {
+    console.log(`Creating bullet list in doc ${documentId}, range: ${startIndex}-${endIndex}, preset: ${bulletPreset}`);
+
+    const request: docs_v1.Schema$Request = {
+        createParagraphBullets: {
+            range: {
+                startIndex: startIndex,
+                endIndex: endIndex
+            },
+            bulletPreset: bulletPreset as any
+        }
+    };
+
+    return executeBatchUpdate(docs, documentId, [request]);
+}
+
+/**
+ * Removes bullet formatting from paragraphs in a range
+ */
+export async function removeBulletListInRange(
+    docs: Docs,
+    documentId: string,
+    startIndex: number,
+    endIndex: number
+): Promise<docs_v1.Schema$BatchUpdateDocumentResponse> {
+    console.log(`Removing bullet list in doc ${documentId}, range: ${startIndex}-${endIndex}`);
+
+    const request: docs_v1.Schema$Request = {
+        deleteParagraphBullets: {
+            range: {
+                startIndex: startIndex,
+                endIndex: endIndex
+            }
+        }
+    };
+
+    return executeBatchUpdate(docs, documentId, [request]);
 }
 
 export async function addCommentHelper(docs: Docs, documentId: string, text: string, startIndex: number, endIndex: number): Promise<void> {
@@ -707,4 +894,514 @@ export function findTabById(doc: docs_v1.Schema$Document, tabId: string): docs_v
     };
 
     return searchTabs(doc.tabs);
+}
+
+// --- Table Cell Editing Helpers ---
+
+/**
+ * Interface for table cell range information
+ */
+export interface TableCellRange {
+    cellStartIndex: number;
+    cellEndIndex: number;
+    contentStartIndex: number;
+    contentEndIndex: number;
+    hasContent: boolean;
+}
+
+/**
+ * Finds a table element in the document at or after the specified index
+ * @param docs - Google Docs API client
+ * @param documentId - The document ID
+ * @param tableStartIndex - The approximate starting index of the table
+ * @returns The table element and its metadata, or null if not found
+ */
+export async function findTableAtIndex(
+    docs: Docs,
+    documentId: string,
+    tableStartIndex: number
+): Promise<{ table: any; startIndex: number; endIndex: number } | null> {
+    try {
+        const res = await docs.documents.get({
+            documentId,
+            fields: 'body(content(startIndex,endIndex,table))',
+        });
+
+        if (!res.data.body?.content) {
+            return null;
+        }
+
+        // Find the table at or near the specified index
+        for (const element of res.data.body.content) {
+            const startIdx = element.startIndex;
+            const endIdx = element.endIndex;
+            if (element.table && startIdx != null && endIdx != null) {
+                // Allow some tolerance in finding the table (within 10 positions)
+                if (startIdx >= tableStartIndex - 10 && startIdx <= tableStartIndex + 10) {
+                    return {
+                        table: element.table,
+                        startIndex: startIdx,
+                        endIndex: endIdx
+                    };
+                }
+                // Also match if the provided index is exactly the table start
+                if (startIdx === tableStartIndex) {
+                    return {
+                        table: element.table,
+                        startIndex: startIdx,
+                        endIndex: endIdx
+                    };
+                }
+            }
+        }
+
+        // If not found with tolerance, try finding any table after the index
+        for (const element of res.data.body.content) {
+            const startIdx = element.startIndex;
+            const endIdx = element.endIndex;
+            if (element.table && startIdx != null && endIdx != null) {
+                if (startIdx >= tableStartIndex) {
+                    return {
+                        table: element.table,
+                        startIndex: startIdx,
+                        endIndex: endIdx
+                    };
+                }
+            }
+        }
+
+        return null;
+    } catch (error: any) {
+        console.error(`Error finding table at index ${tableStartIndex} in doc ${documentId}: ${error.message}`);
+        throw new Error(`Failed to find table: ${error.message}`);
+    }
+}
+
+/**
+ * Gets the content range of a specific table cell
+ * @param docs - Google Docs API client
+ * @param documentId - The document ID
+ * @param tableStartIndex - The starting index of the table
+ * @param rowIndex - Row index (0-based)
+ * @param columnIndex - Column index (0-based)
+ * @returns The cell range information, or null if not found
+ */
+export async function getTableCellRange(
+    docs: Docs,
+    documentId: string,
+    tableStartIndex: number,
+    rowIndex: number,
+    columnIndex: number
+): Promise<TableCellRange | null> {
+    try {
+        // Get full document structure to find table cells
+        const res = await docs.documents.get({
+            documentId,
+            fields: 'body(content(startIndex,endIndex,table(tableRows(tableCells(startIndex,endIndex,content(startIndex,endIndex,paragraph(elements(startIndex,endIndex,textRun(content)))))))))',
+        });
+
+        if (!res.data.body?.content) {
+            console.warn(`No content found in document ${documentId}`);
+            return null;
+        }
+
+        // Find the table
+        let targetTable: any = null;
+        for (const element of res.data.body.content) {
+            const startIdx = element.startIndex;
+            if (element.table && startIdx != null) {
+                // Match table by start index (with some tolerance)
+                if (Math.abs(startIdx - tableStartIndex) <= 10) {
+                    targetTable = element.table;
+                    break;
+                }
+            }
+        }
+
+        if (!targetTable) {
+            console.warn(`Could not find table at index ${tableStartIndex}`);
+            return null;
+        }
+
+        // Navigate to the specific cell
+        const tableRows = targetTable.tableRows;
+        if (!tableRows || rowIndex >= tableRows.length) {
+            console.warn(`Row index ${rowIndex} out of bounds (table has ${tableRows?.length || 0} rows)`);
+            return null;
+        }
+
+        const row = tableRows[rowIndex];
+        const tableCells = row.tableCells;
+        if (!tableCells || columnIndex >= tableCells.length) {
+            console.warn(`Column index ${columnIndex} out of bounds (row has ${tableCells?.length || 0} columns)`);
+            return null;
+        }
+
+        const cell = tableCells[columnIndex];
+        const cellStartIndex = cell.startIndex;
+        const cellEndIndex = cell.endIndex;
+
+        // Get the content range within the cell
+        let contentStartIndex = cellStartIndex;
+        let contentEndIndex = cellEndIndex;
+        let hasContent = false;
+
+        if (cell.content && cell.content.length > 0) {
+            const firstContent = cell.content[0];
+            if (firstContent.startIndex !== undefined) {
+                contentStartIndex = firstContent.startIndex;
+            }
+
+            // Check if there's actual text content
+            for (const contentElement of cell.content) {
+                if (contentElement.paragraph?.elements) {
+                    for (const elem of contentElement.paragraph.elements) {
+                        if (elem.textRun?.content && elem.textRun.content.trim()) {
+                            hasContent = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Get the last content element's end index
+            const lastContent = cell.content[cell.content.length - 1];
+            if (lastContent.endIndex !== undefined) {
+                contentEndIndex = lastContent.endIndex;
+            }
+        }
+
+        console.log(`Found cell (${rowIndex}, ${columnIndex}): cellStart=${cellStartIndex}, cellEnd=${cellEndIndex}, contentStart=${contentStartIndex}, contentEnd=${contentEndIndex}, hasContent=${hasContent}`);
+
+        return {
+            cellStartIndex,
+            cellEndIndex,
+            contentStartIndex,
+            contentEndIndex,
+            hasContent
+        };
+    } catch (error: any) {
+        console.error(`Error getting table cell range: ${error.message}`);
+        throw new Error(`Failed to get table cell range: ${error.message}`);
+    }
+}
+
+/**
+ * Edits a table cell's content and optionally applies styling
+ * @param docs - Google Docs API client
+ * @param documentId - The document ID
+ * @param tableStartIndex - The starting index of the table
+ * @param rowIndex - Row index (0-based)
+ * @param columnIndex - Column index (0-based)
+ * @param textContent - New text content for the cell (optional)
+ * @param textStyle - Text styling to apply (optional)
+ * @param paragraphStyle - Paragraph styling to apply (optional)
+ * @returns Promise with the result
+ */
+export async function editTableCell(
+    docs: Docs,
+    documentId: string,
+    tableStartIndex: number,
+    rowIndex: number,
+    columnIndex: number,
+    textContent?: string,
+    textStyle?: TextStyleArgs,
+    paragraphStyle?: ParagraphStyleArgs
+): Promise<{ success: boolean; message: string }> {
+    // Get the cell range
+    const cellRange = await getTableCellRange(docs, documentId, tableStartIndex, rowIndex, columnIndex);
+
+    if (!cellRange) {
+        throw new UserError(`Could not find cell at row ${rowIndex}, column ${columnIndex} in table at index ${tableStartIndex}`);
+    }
+
+    const requests: docs_v1.Schema$Request[] = [];
+
+    // If we need to set text content
+    if (textContent !== undefined) {
+        // First, delete existing content if any (but preserve the paragraph structure)
+        // We need to be careful here - cells always have at least one paragraph with a newline
+        // We should delete content but not the structural newline
+
+        if (cellRange.hasContent) {
+            // Delete existing content (everything except the final newline)
+            // The cell content typically ends with a newline we want to preserve
+            const deleteEnd = cellRange.contentEndIndex - 1; // Keep the trailing newline
+            if (deleteEnd > cellRange.contentStartIndex) {
+                requests.push({
+                    deleteContentRange: {
+                        range: {
+                            startIndex: cellRange.contentStartIndex,
+                            endIndex: deleteEnd
+                        }
+                    }
+                });
+            }
+        }
+
+        // Insert new text at the cell's content start
+        if (textContent) {
+            requests.push({
+                insertText: {
+                    location: { index: cellRange.contentStartIndex },
+                    text: textContent
+                }
+            });
+        }
+    }
+
+    // Execute the batch update
+    if (requests.length > 0) {
+        await executeBatchUpdate(docs, documentId, requests);
+    }
+
+    // Now apply styles if requested (need to re-fetch document to get updated indices)
+    if ((textStyle || paragraphStyle) && textContent) {
+        // Re-fetch the cell range after content modification
+        const updatedCellRange = await getTableCellRange(docs, documentId, tableStartIndex, rowIndex, columnIndex);
+
+        if (updatedCellRange) {
+            const styleRequests: docs_v1.Schema$Request[] = [];
+
+            // Calculate the new text range
+            const textStart = updatedCellRange.contentStartIndex;
+            const textEnd = textStart + (textContent?.length || 0);
+
+            // Apply text style
+            if (textStyle && textContent) {
+                const textStyleResult = buildUpdateTextStyleRequest(textStart, textEnd, textStyle);
+                if (textStyleResult) {
+                    styleRequests.push(textStyleResult.request);
+                }
+            }
+
+            // Apply paragraph style
+            if (paragraphStyle) {
+                const paragraphStyleResult = buildUpdateParagraphStyleRequest(
+                    updatedCellRange.contentStartIndex,
+                    updatedCellRange.contentEndIndex,
+                    paragraphStyle
+                );
+                if (paragraphStyleResult) {
+                    styleRequests.push(paragraphStyleResult.request);
+                }
+            }
+
+            if (styleRequests.length > 0) {
+                await executeBatchUpdate(docs, documentId, styleRequests);
+            }
+        }
+    }
+
+    return {
+        success: true,
+        message: `Successfully edited cell (${rowIndex}, ${columnIndex}) in table at index ${tableStartIndex}`
+    };
+}
+
+/**
+ * Creates a table with data in one efficient operation
+ * @param docs - Google Docs API client
+ * @param documentId - The document ID
+ * @param insertIndex - Where to insert the table
+ * @param headers - Array of header strings
+ * @param rows - 2D array of row data
+ * @param boldHeaders - Whether to bold the header row (default true)
+ * @param boldTotalRow - Whether to bold rows containing "Total" (default true)
+ * @returns Promise with the result
+ */
+export async function createTableWithData(
+    docs: Docs,
+    documentId: string,
+    insertIndex: number,
+    headers: string[],
+    rows: string[][],
+    boldHeaders: boolean = true,
+    boldTotalRow: boolean = true
+): Promise<{ success: boolean; message: string; tableStartIndex: number }> {
+    const numRows = rows.length + 1; // +1 for header
+    const numCols = headers.length;
+
+    if (numCols === 0) {
+        throw new UserError("Headers array cannot be empty");
+    }
+
+    // Step 1: Insert the empty table
+    const insertTableRequest: docs_v1.Schema$Request = {
+        insertTable: {
+            rows: numRows,
+            columns: numCols,
+            location: { index: insertIndex }
+        }
+    };
+    await executeBatchUpdate(docs, documentId, [insertTableRequest]);
+
+    // Step 2: Re-fetch document to get table structure
+    const doc = await docs.documents.get({
+        documentId,
+    });
+
+    if (!doc.data.body?.content) {
+        throw new Error("Failed to fetch document content after table insertion");
+    }
+
+    // Step 3: Find the table we just inserted
+    let tableElement: any = null;
+    let tableStartIndex = 0;
+    for (const element of doc.data.body.content) {
+        if (element.table) {
+            const startIdx = element.startIndex;
+            if (startIdx != null && startIdx >= insertIndex - 5) {
+                tableElement = element.table;
+                tableStartIndex = startIdx;
+                break;
+            }
+        }
+    }
+
+    if (!tableElement) {
+        throw new Error("Could not find the inserted table");
+    }
+
+    // Step 4: Collect all cell data and their indices
+    const cellInsertions: { index: number; text: string; isBold: boolean }[] = [];
+    const tableRows = tableElement.tableRows || [];
+
+    for (let rowIdx = 0; rowIdx < tableRows.length; rowIdx++) {
+        const row = tableRows[rowIdx];
+        const tableCells = row.tableCells || [];
+
+        for (let colIdx = 0; colIdx < tableCells.length; colIdx++) {
+            const cell = tableCells[colIdx];
+            const cellContent = cell.content || [];
+
+            if (cellContent.length > 0) {
+                const firstContent = cellContent[0];
+                // Get the correct index for text insertion - it's inside the paragraph element
+                let cellStartIndex: number | null | undefined = null;
+                if (firstContent.paragraph?.elements?.[0]?.startIndex != null) {
+                    cellStartIndex = firstContent.paragraph.elements[0].startIndex;
+                } else if (firstContent.startIndex != null) {
+                    cellStartIndex = firstContent.startIndex;
+                }
+
+                // Determine the text to insert
+                let cellText = '';
+                let isBold = false;
+
+                if (rowIdx === 0) {
+                    // Header row
+                    cellText = headers[colIdx] || '';
+                    isBold = boldHeaders;
+                } else {
+                    // Data row
+                    const dataRowIdx = rowIdx - 1;
+                    if (dataRowIdx < rows.length && colIdx < rows[dataRowIdx].length) {
+                        cellText = rows[dataRowIdx][colIdx] || '';
+                    }
+                    // Check if it's a total row
+                    if (boldTotalRow && rows[dataRowIdx] && rows[dataRowIdx][0] &&
+                        rows[dataRowIdx][0].toLowerCase().includes('total')) {
+                        isBold = true;
+                    }
+                }
+
+                if (cellText && cellStartIndex != null) {
+                    cellInsertions.push({
+                        index: cellStartIndex,
+                        text: cellText,
+                        isBold
+                    });
+                }
+            }
+        }
+    }
+
+    // Step 5: Sort by index descending (insert in reverse order to maintain indices)
+    cellInsertions.sort((a, b) => b.index - a.index);
+
+    // Step 6: Build insertText requests
+    const textRequests: docs_v1.Schema$Request[] = cellInsertions.map(cell => ({
+        insertText: {
+            location: { index: cell.index },
+            text: cell.text
+        }
+    }));
+
+    // Execute text insertions
+    if (textRequests.length > 0) {
+        await executeBatchUpdate(docs, documentId, textRequests);
+    }
+
+    // Step 7: Re-fetch document and apply bold styling
+    const boldCells = cellInsertions.filter(c => c.isBold);
+    if (boldCells.length > 0) {
+        // Re-fetch to get updated indices
+        const docAfterText = await docs.documents.get({
+            documentId,
+        });
+
+        if (docAfterText.data.body?.content) {
+            const boldRequests: docs_v1.Schema$Request[] = [];
+
+            for (const element of docAfterText.data.body.content) {
+                if (element.table && element.startIndex != null &&
+                    Math.abs(element.startIndex - tableStartIndex) <= 20) {
+                    const tRows = element.table.tableRows || [];
+
+                    for (let rowIdx = 0; rowIdx < tRows.length; rowIdx++) {
+                        const row = tRows[rowIdx];
+                        const cells = row.tableCells || [];
+
+                        // Determine if this row should be bold
+                        let shouldBoldRow = false;
+                        if (rowIdx === 0 && boldHeaders) {
+                            shouldBoldRow = true;
+                        } else if (boldTotalRow && rowIdx > 0) {
+                            const dataRowIdx = rowIdx - 1;
+                            if (dataRowIdx < rows.length && rows[dataRowIdx][0] &&
+                                rows[dataRowIdx][0].toLowerCase().includes('total')) {
+                                shouldBoldRow = true;
+                            }
+                        }
+
+                        if (shouldBoldRow) {
+                            for (const cell of cells) {
+                                const cellContent = cell.content || [];
+                                for (const para of cellContent) {
+                                    const elements = para.paragraph?.elements || [];
+                                    for (const elem of elements) {
+                                        if (elem.textRun?.content && elem.textRun.content.trim()) {
+                                            const start = elem.startIndex;
+                                            const end = elem.endIndex;
+                                            if (start != null && end != null && end > start) {
+                                                boldRequests.push({
+                                                    updateTextStyle: {
+                                                        range: { startIndex: start, endIndex: end },
+                                                        textStyle: { bold: true },
+                                                        fields: 'bold'
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+
+            if (boldRequests.length > 0) {
+                await executeBatchUpdate(docs, documentId, boldRequests);
+            }
+        }
+    }
+
+    return {
+        success: true,
+        message: `Successfully created ${numRows}x${numCols} table with data at index ${insertIndex}`,
+        tableStartIndex
+    };
 }
